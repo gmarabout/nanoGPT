@@ -27,7 +27,7 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-from torch.profiler import profile as torch_profile, ProfilerActivity, schedule, tensorboard_trace_handler
+from torch.utils.tensorboard import SummaryWriter
 
 from model import GPTConfig, GPT
 
@@ -279,20 +279,12 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # Profiling
-tensorboard_log_output = os.environ.get('FLEXAI_TENSORBOARD_LOG_DIR', './bench_log')
-profiler_schedule = schedule(wait=1, warmup=1, active=5, repeat=1)
-prof_ctx = (
-    torch_profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        schedule=profiler_schedule,
-        on_trace_ready=tensorboard_trace_handler(tensorboard_log_output),
-        with_stack=False,
-        with_flops=True,
-        record_shapes=False,
-        profile_memory=False,
-    )
-    if profile and master_process else nullcontext()
-)
+if profile and master_process:
+    tensorboard_log_output = os.environ.get('FLEXAI_TENSORBOARD_LOG_DIR')
+    if tensorboard_log_output is None:
+        raise ValueError("FLEXAI_TENSORBOARD_LOG_DIR environment variable is not set.")
+
+    writer = SummaryWriter(tensorboard_log_output)
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -301,97 +293,109 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 
-with prof_ctx as prof:
-    while True:
+while True:
+    # determine and set the learning rate for this iteration
+    lr = get_lr(iter_num) if decay_lr else learning_rate
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
 
-        # determine and set the learning rate for this iteration
-        lr = get_lr(iter_num) if decay_lr else learning_rate
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+    # evaluate the loss on train/val sets and write checkpoints
+    if iter_num % eval_interval == 0 and master_process:
+        losses = estimate_loss()
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        if wandb_log:
+            wandb.log({
+                "iter": iter_num,
+                "train/loss": losses['train'],
+                "val/loss": losses['val'],
+                "lr": lr,
+                "mfu": running_mfu*100, # convert to percentage
+            })
 
-        # evaluate the loss on train/val sets and write checkpoints
-        if iter_num % eval_interval == 0 and master_process:
-            losses = estimate_loss()
-            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-            if wandb_log:
-                wandb.log({
-                    "iter": iter_num,
-                    "train/loss": losses['train'],
-                    "val/loss": losses['val'],
-                    "lr": lr,
-                    "mfu": running_mfu*100, # convert to percentage
-                })
-            if losses['val'] < best_val_loss or always_save_checkpoint:
-                best_val_loss = losses['val']
-                if iter_num > 0:
-                    checkpoint = {
-                        'model': raw_model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'model_args': model_args,
-                        'iter_num': iter_num,
-                        'best_val_loss': best_val_loss,
-                        'config': config,
-                    }
-                    checkpoint_dir = get_checkpoint_dir()
-                    os.makedirs(checkpoint_dir, exist_ok=True)
-                    checkpoint_path = os.path.join(checkpoint_dir, 'ckpt.pt')
-                    if fake_checkpoint:
-                        print(f"creating dummy checkpoint of size {fake_checkpoint_size_mb}MB at {checkpoint_path}")
-                        dummy_checkpoint = create_dummy_checkpoint(fake_checkpoint_size_mb)
-                        torch.save(dummy_checkpoint, checkpoint_path)
-                    else:
-                        print(f"saving checkpoint to {checkpoint_path}")
-                        torch.save(checkpoint, checkpoint_path)
-        if iter_num == 0 and eval_only:
-            break
-
-        # forward backward update, with optional gradient accumulation to simulate larger batch size
-        # and using the GradScaler if data type is float16
-        for micro_step in range(gradient_accumulation_steps):
-            if ddp:
-                # in DDP training we only need to sync gradients at the last micro step.
-                # the official way to do this is with model.no_sync() context manager, but
-                # I really dislike that this bloats the code and forces us to repeat code
-                # looking at the source of that context manager, it just toggles this variable
-                model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-            with ctx:
-                logits, loss = model(X, Y)
-                loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-            # immediately async prefetch next batch while model is doing the forward pass on the GPU
-            X, Y = get_batch('train')
-            # backward pass, with gradient scaling if training in fp16
-            scaler.scale(loss).backward()
-        # clip the gradient
-        if grad_clip != 0.0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        # step the optimizer and scaler if training in fp16
-        scaler.step(optimizer)
-        scaler.update()
-        # flush the gradients as soon as we can, no need for this memory anymore
-        optimizer.zero_grad(set_to_none=True)
-
-        # timing and logging
-        t1 = time.time()
-        dt = t1 - t0
-        t0 = t1
-        if iter_num % log_interval == 0 and master_process:
-            # get loss as float. note: this is a CPU-GPU sync point
-            # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-            lossf = loss.item() * gradient_accumulation_steps
-            if local_iter_num >= 5: # let the training loop settle a bit
-                mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-                running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-        iter_num += 1
-        local_iter_num += 1
-
+        # TensorBoard logging
         if profile and master_process:
-            prof.step()
+            writer.add_scalar("Loss/train", losses['train'], iter_num)
+            writer.add_scalar("Loss/val", losses['val'], iter_num)
+            writer.add_scalar("Learning Rate", lr, iter_num)
+            writer.add_scalar("MFU", running_mfu*100, iter_num)
 
-        # termination conditions
-        if iter_num > max_iters:
-            break
+        if losses['val'] < best_val_loss or always_save_checkpoint:
+            best_val_loss = losses['val']
+            if iter_num > 0:
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'model_args': model_args,
+                    'iter_num': iter_num,
+                    'best_val_loss': best_val_loss,
+                    'config': config,
+                }
+                checkpoint_dir = get_checkpoint_dir()
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                checkpoint_path = os.path.join(checkpoint_dir, 'ckpt.pt')
+                if fake_checkpoint:
+                    print(f"creating dummy checkpoint of size {fake_checkpoint_size_mb}MB at {checkpoint_path}")
+                    dummy_checkpoint = create_dummy_checkpoint(fake_checkpoint_size_mb)
+                    torch.save(dummy_checkpoint, checkpoint_path)
+                else:
+                    print(f"saving checkpoint to {checkpoint_path}")
+                    torch.save(checkpoint, checkpoint_path)
+    if iter_num == 0 and eval_only:
+        break
 
-    if ddp:
-        destroy_process_group()
+    # forward backward update, with optional gradient accumulation to simulate larger batch size
+    # and using the GradScaler if data type is float16
+    for micro_step in range(gradient_accumulation_steps):
+        if ddp:
+            # in DDP training we only need to sync gradients at the last micro step.
+            # the official way to do this is with model.no_sync() context manager, but
+            # I really dislike that this bloats the code and forces us to repeat code
+            # looking at the source of that context manager, it just toggles this variable
+            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+        with ctx:
+            logits, loss = model(X, Y)
+            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+        # immediately async prefetch next batch while model is doing the forward pass on the GPU
+        X, Y = get_batch('train')
+        # backward pass, with gradient scaling if training in fp16
+        scaler.scale(loss).backward()
+    # clip the gradient
+    if grad_clip != 0.0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    # step the optimizer and scaler if training in fp16
+    scaler.step(optimizer)
+    scaler.update()
+    # flush the gradients as soon as we can, no need for this memory anymore
+    optimizer.zero_grad(set_to_none=True)
+
+    # timing and logging
+    t1 = time.time()
+    dt = t1 - t0
+    t0 = t1
+    if iter_num % log_interval == 0 and master_process:
+        # get loss as float. note: this is a CPU-GPU sync point
+        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+        lossf = loss.item() * gradient_accumulation_steps
+        if local_iter_num >= 5: # let the training loop settle a bit
+            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+
+        # TensorBoard logging
+        if profile and master_process:
+            writer.add_scalar("Loss/step", lossf, iter_num)
+            writer.add_scalar("StepTime", dt, iter_num)
+
+    iter_num += 1
+    local_iter_num += 1
+
+    # termination conditions
+    if iter_num > max_iters:
+        break
+
+if ddp:
+    destroy_process_group()
+
+if profile and master_process:
+    writer.close()
