@@ -1,0 +1,83 @@
+diff --git a/config/finetune_shakespeare.py b/config/finetune_shakespeare.py
+index 148a4c4..195b8ec 100644
+--- a/config/finetune_shakespeare.py
++++ b/config/finetune_shakespeare.py
+@@ -1,12 +1,14 @@
+ import time
+ 
+ out_dir = 'out-shakespeare'
++checkpoint_dir = ''
+ eval_interval = 5
+ eval_iters = 40
+ wandb_log = False # feel free to turn on
+ wandb_project = 'shakespeare'
+ wandb_run_name = 'ft-' + str(time.time())
+ 
++dataset_dir = 'nanoGPT-dataset'
+ dataset = 'shakespeare'
+ init_from = 'gpt2-xl' # this is the largest GPT-2 model
+ 
+diff --git a/config/train_shakespeare_char.py b/config/train_shakespeare_char.py
+index 41c81df..40ba9b7 100644
+--- a/config/train_shakespeare_char.py
++++ b/config/train_shakespeare_char.py
+@@ -2,6 +2,7 @@
+ # good for debugging and playing on macbooks and such
+ 
+ out_dir = 'out-shakespeare-char'
++checkpoint_dir = ''
+ eval_interval = 250 # keep frequent because we'll overfit
+ eval_iters = 200
+ log_interval = 10 # don't print too too often
+@@ -13,6 +14,7 @@ wandb_log = False # override via command line if you like
+ wandb_project = 'shakespeare-char'
+ wandb_run_name = 'mini-gpt'
+ 
++dataset_dir = 'nanoGPT-dataset'
+ dataset = 'shakespeare_char'
+ gradient_accumulation_steps = 1
+ batch_size = 64
+diff --git a/train.py b/train.py
+index 2a048b1..76fd114 100644
+--- a/train.py
++++ b/train.py
+@@ -33,6 +33,7 @@ from model import GPTConfig, GPT
+ # default config values designed to train a gpt2 (124M) on OpenWebText
+ # I/O
+ out_dir = 'out'
++checkpoint_dir = '' # directory containing checkpoint to resume from, if using init_from='resume'
+ eval_interval = 2000
+ log_interval = 1
+ eval_iters = 200
+@@ -44,6 +45,7 @@ wandb_log = False # disabled by default
+ wandb_project = 'owt'
+ wandb_run_name = 'gpt2' # 'run' + str(time.time())
+ # data
++dataset_dir = ''
+ dataset = 'openwebtext'
+ gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
+ batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+@@ -112,7 +114,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
+ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+ 
+ # poor man's data loader
+-data_dir = os.path.join('/input', dataset)
++data_dir = os.path.join('/input', dataset_dir, dataset)
+ if not os.path.exists(data_dir):
+     data_dir = os.path.join('data', dataset)
+ def get_batch(split):
+@@ -158,9 +160,11 @@ if init_from == 'scratch':
+     gptconf = GPTConfig(**model_args)
+     model = GPT(gptconf)
+ elif init_from == 'resume':
+-    print(f"Resuming training from {out_dir}")
+-    # resume training from a checkpoint.
+-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
++    # Use checkpoint_dir if specified, otherwise use out_dir
++    resume_dir = checkpoint_dir if checkpoint_dir != '' else out_dir
++    print(f"Resuming training from {resume_dir}")
++    # resume training from a checkpoint
++    ckpt_path = os.path.join(resume_dir, 'ckpt.pt')
+     checkpoint = torch.load(ckpt_path, map_location=device)
+     checkpoint_model_args = checkpoint['model_args']
+     # force these config attributes to be equal otherwise we can't even resume training
