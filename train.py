@@ -46,8 +46,6 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
-# profile
-profile = False
 # data
 dataset_dir = ''
 dataset = 'openwebtext'
@@ -279,7 +277,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # Profiling
-if profile and master_process:
+if master_process:
     tensorboard_log_output = os.environ.get('FLEXAI_TENSORBOARD_LOG_DIR')
     if tensorboard_log_output is None:
         raise ValueError("FLEXAI_TENSORBOARD_LOG_DIR environment variable is not set.")
@@ -313,7 +311,7 @@ while True:
             })
 
         # TensorBoard logging
-        if profile and master_process:
+        if master_process:
             writer.add_scalar("Loss/train", losses['train'], iter_num)
             writer.add_scalar("Loss/val", losses['val'], iter_num)
             writer.add_scalar("Learning Rate", lr, iter_num)
@@ -383,7 +381,7 @@ while True:
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
 
         # TensorBoard logging
-        if profile and master_process:
+        if master_process:
             writer.add_scalar("Loss/step", lossf, iter_num)
             writer.add_scalar("StepTime", dt, iter_num)
 
