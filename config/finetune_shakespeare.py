@@ -1,7 +1,7 @@
 import time
 
 out_dir = 'out-shakespeare'
-checkpoint_dir = ''  # if provided, will be used for saving and loading checkpoints
+checkpoint_dir = ''
 fake_checkpoint = False
 fake_checkpoint_size_mb = 100
 eval_interval = 5
