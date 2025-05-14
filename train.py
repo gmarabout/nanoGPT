@@ -226,17 +226,7 @@ if ddp:
 
 def get_checkpoint_dir():
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # If checkpoint_dir is specified, create a timestamped subdirectory inside it
-    if checkpoint_dir:
-        checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_{timestamp}')
-        os.makedirs(checkpoint_path, exist_ok=True)
-        return checkpoint_path
-    
-    # Otherwise, create a timestamped directory within out_dir
-    checkpoint_path = os.path.join(out_dir, f'checkpoint_{timestamp}')
-    os.makedirs(checkpoint_path, exist_ok=True)
-    return checkpoint_path
+    return os.path.join(out_dir, f'checkpoint_{timestamp}')
 
 def create_dummy_checkpoint(size_mb):
     """Create a dummy checkpoint of specified size in MB using torch.save"""
@@ -342,8 +332,9 @@ with prof_ctx as prof:
                         'best_val_loss': best_val_loss,
                         'config': config,
                     }
-                    checkpoint_dir_path = get_checkpoint_dir()
-                    checkpoint_path = os.path.join(checkpoint_dir_path, 'ckpt.pt')
+                    checkpoint_dir = get_checkpoint_dir()
+                    os.makedirs(checkpoint_dir, exist_ok=True)
+                    checkpoint_path = os.path.join(checkpoint_dir, 'ckpt.pt')
                     if fake_checkpoint:
                         print(f"creating dummy checkpoint of size {fake_checkpoint_size_mb}MB at {checkpoint_path}")
                         dummy_checkpoint = create_dummy_checkpoint(fake_checkpoint_size_mb)
