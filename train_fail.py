@@ -1,0 +1,1 @@
+raise RuntimeError("Training failed.")
