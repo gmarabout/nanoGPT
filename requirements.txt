@@ -6,3 +6,4 @@ datasets
 tiktoken
 wandb
 tqdm
+this_dependency_does_not_exist
